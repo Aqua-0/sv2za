@@ -1,44 +1,113 @@
 name: build
 
 on:
-    push:
-    pull_request:
-    workflow_dispatch:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 jobs:
-    build:
-        strategy:
-            fail-fast: false
-            matrix:
-                include:
-                    - os: windows-latest
-                      target: x86_64-pc-windows-msvc
-                      ext: .exe
-                    - os: ubuntu-latest
-                      target: x86_64-unknown-linux-gnu
-                      ext: ""
-                    - os: macos-latest
-                      target: aarch64-apple-darwin
-                      ext: ""
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
 
-        runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
 
-        steps:
-            - uses: actions/checkout@v4
+    steps:
+      - uses: actions/checkout@v4
 
-            - uses: dtolnay/rust-toolchain@stable
-              with:
-                  targets: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-            - uses: Swatinem/rust-cache@v2
-              with:
-                  workspaces: .
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
 
-            - name: Build (svza only)
-              run: cargo build --release --target ${{ matrix.target }} --bin svza
+      - name: Build (svza only)
+        run: cargo build --release --target ${{ matrix.target }} --bin svza
 
-            - name: Upload artifact (svza only)
-              uses: actions/upload-artifact@v4
-              with:
-                  name: sv2za-${{ matrix.target }}
-                  path: target/${{ matrix.target }}/release/svza${{ matrix.ext }}
+      - name: Upload artifact (svza only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sv2za-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/svza${{ matrix.ext }}
+
+  nightly_release:
+    name: Nightly release (rolling)
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: sv2za-*
+          merge-multiple: false
+
+      - name: Prepare release assets (unique filenames)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          for dir in artifacts/sv2za-*; do
+            [ -d "$dir" ] || continue
+            base="$(basename "$dir")"
+
+            file="$(find "$dir" -maxdepth 1 -type f | head -n 1 || true)"
+            if [[ -z "${file}" ]]; then
+              echo "No files found in $dir" >&2
+              exit 1
+            fi
+
+            fname="$(basename "$file")"
+            ext=""
+            if [[ "$fname" == *.* ]]; then
+              ext=".${fname##*.}"
+            fi
+
+            mv "$file" "release-assets/${base}${ext}"
+          done
+
+          ls -la release-assets
+
+      - name: Move nightly tag to newest commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly "${GITHUB_SHA}"
+          git push -f origin nightly
+
+      - name: Create/update nightly prerelease + upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES="Automated nightly build from commit ${GITHUB_SHA}."
+
+          gh release view nightly >/dev/null 2>&1 || gh release create nightly -t "Nightly" -n "$NOTES" --prerelease
+          gh release edit nightly -t "Nightly" -n "$NOTES" --prerelease
+          gh release upload nightly release-assets/* --clobber
